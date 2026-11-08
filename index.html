@@ -70,6 +70,12 @@ h1{font-size:24px;font-weight:800;background:linear-gradient(135deg,var(--accent
 .txn-amount{font-size:15px;font-weight:700}
 .txn-amount.income{color:var(--income)}
 .txn-amount.expense{color:var(--expense)}
+.txn-actions{display:flex;gap:6px;flex-shrink:0}
+.txn-action{padding:5px 9px;border:none;border-radius:6px;background:var(--surface2);color:var(--text2);font-size:12px;cursor:pointer}
+.txn-action:hover{background:var(--border);color:var(--text)}
+.txn-action.delete:hover{background:rgba(248,81,73,0.2);color:var(--expense)}
+.txn-toolbar{display:flex;gap:8px;margin-bottom:8px}
+.txn-toolbar .btn{flex:1}
 
 .empty-state{text-align:center;padding:40px 20px;color:var(--text2)}
 .empty-icon{font-size:48px;margin-bottom:12px}
@@ -132,6 +138,11 @@ h1{font-size:24px;font-weight:800;background:linear-gradient(135deg,var(--accent
 
   <!-- 明细页 -->
   <div id="tab-transactions">
+    <div class="txn-toolbar">
+      <button class="btn btn-secondary btn-sm" onclick="exportData()">⬇️ 导出 JSON</button>
+      <button class="btn btn-secondary btn-sm" onclick="triggerImport()">⬆️ 导入 JSON</button>
+      <input type="file" id="importFile" accept="application/json,.json" class="hidden" onchange="importData(event)">
+    </div>
     <div class="search-bar">
       <input class="input" id="searchInput" placeholder="🔍 搜索备注或分类..." oninput="renderTransactions()">
     </div>
@@ -164,8 +175,12 @@ h1{font-size:24px;font-weight:800;background:linear-gradient(135deg,var(--accent
     <div class="card">
       <div class="card-title">🎯 月度预算</div>
       <div class="form-group">
-        <label class="form-label">本月支出预算</label>
-        <input class="input" type="number" id="budgetInput" placeholder="例如: 3000">
+        <label class="form-label">预算月份</label>
+        <input class="input" type="month" id="budgetMonth" onchange="changeBudgetMonth()">
+      </div>
+      <div class="form-group">
+        <label class="form-label">该月支出预算</label>
+        <input class="input" type="number" id="budgetInput" placeholder="例如: 3000" min="0" step="0.01" inputmode="decimal">
       </div>
       <button class="btn btn-primary btn-block" onclick="saveBudget()">保存预算</button>
       <div id="budgetStatus" style="margin-top:16px"></div>
@@ -176,7 +191,7 @@ h1{font-size:24px;font-weight:800;background:linear-gradient(135deg,var(--accent
 <!-- 记账弹窗 -->
 <div class="modal-overlay hidden" id="addModal">
   <div class="modal">
-    <div class="modal-title">💰 记一笔账</div>
+    <div class="modal-title" id="addModalTitle">💰 记一笔账</div>
     <div class="type-toggle">
       <button class="type-btn expense active" id="typeExpense" onclick="selectType('expense')">支出</button>
       <button class="type-btn income" id="typeIncome" onclick="selectType('income')">收入</button>
@@ -202,11 +217,28 @@ h1{font-size:24px;font-weight:800;background:linear-gradient(135deg,var(--accent
 
 <button class="fab" onclick="showAddModal()">+</button>
 
-<script>
+<script type="module">
+import {
+  monthKey,
+  monthLabel,
+  normalizeAmount,
+  isValidAmount,
+  monthSummary,
+  averageDailyExpense,
+  sumByType,
+  getBudget,
+  setBudget,
+  normalizeData,
+  parseImport,
+  exportPayload
+} from './src/ledger.js';
+
 const STORAGE_KEY = 'easy_ledger_data';
-let data = { transactions: [], budget: 0 };
+let data = { transactions: [], budgets: {} };
 let currentType = 'expense';
 let selectedCategory = null;
+let editingId = null;
+let budgetMonthKey = monthKey(new Date());
 
 const categories = {
   expense: [
@@ -224,8 +256,9 @@ const categories = {
 function loadData() {
   try {
     const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) data = JSON.parse(saved);
+    if (saved) data = normalizeData(JSON.parse(saved));
   } catch(e) {}
+  if (!data.budgets) data.budgets = {};
 }
 
 function saveData() {
@@ -268,15 +301,8 @@ function switchTab(tab) {
 }
 
 function updateBalance() {
-  const now = new Date();
-  const monthTxns = data.transactions.filter(t => {
-    const d = new Date(t.date);
-    return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
-  });
-  
-  const income = monthTxns.filter(t => t.type === 'income').reduce((s,t) => s + t.amount, 0);
-  const expense = monthTxns.filter(t => t.type === 'expense').reduce((s,t) => s + t.amount, 0);
-  const balance = income - expense;
+  const summary = monthSummary(data.transactions, monthKey(new Date()));
+  const { income, expense, balance } = summary;
   
   const balEl = document.getElementById('balanceAmount');
   balEl.textContent = (balance >= 0 ? '' : '-') + formatMoney(balance);
@@ -286,72 +312,128 @@ function updateBalance() {
   document.getElementById('monthExpense').textContent = formatMoney(expense);
 }
 
+function makeTxnAction(label, className, handler) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'txn-action ' + className;
+  button.textContent = label;
+  button.addEventListener('click', handler);
+  return button;
+}
+
 function renderTransactions() {
   const list = document.getElementById('txnList');
   const empty = document.getElementById('emptyTxn');
   const search = document.getElementById('searchInput').value.toLowerCase();
-  
-  let txns = [...data.transactions].sort((a,b) => new Date(b.date) - new Date(a.date));
-  
+
+  let txns = [...data.transactions].sort((a, b) => new Date(b.date) - new Date(a.date));
+
   if (search) {
     txns = txns.filter(t => {
       const cat = getCategoryInfo(t.category, t.type);
       return (t.note || '').toLowerCase().includes(search) || cat.name.toLowerCase().includes(search);
     });
   }
-  
+
   if (txns.length === 0) {
-    list.innerHTML = '';
+    list.replaceChildren();
     empty.classList.remove('hidden');
     return;
   }
   empty.classList.add('hidden');
-  
-  // Group by date
-  const groups = {};
+
+  const groups = new Map();
   txns.forEach(t => {
     const dateKey = new Date(t.date).toDateString();
-    if (!groups[dateKey]) groups[dateKey] = [];
-    groups[dateKey].push(t);
+    if (!groups.has(dateKey)) groups.set(dateKey, []);
+    groups.get(dateKey).push(t);
   });
-  
-  let html = '';
-  Object.keys(groups).forEach(dateKey => {
-    const dayTxns = groups[dateKey];
-    const dayExpense = dayTxns.filter(t => t.type === 'expense').reduce((s,t) => s + t.amount, 0);
-    const dayIncome = dayTxns.filter(t => t.type === 'income').reduce((s,t) => s + t.amount, 0);
-    
-    html += `<div class="txn-group">
-      <div class="txn-date">
-        <span>${formatDate(dateKey)}</span>
-        <span>支${formatMoney(dayExpense)} 收${formatMoney(dayIncome)}</span>
-      </div>`;
-    
+
+  list.replaceChildren();
+  groups.forEach((dayTxns, dateKey) => {
+    const dayExpense = dayTxns.filter(t => t.type === 'expense').reduce((s, t) => s + t.amount, 0);
+    const dayIncome = dayTxns.filter(t => t.type === 'income').reduce((s, t) => s + t.amount, 0);
+
+    const group = document.createElement('div');
+    group.className = 'txn-group';
+
+    const header = document.createElement('div');
+    header.className = 'txn-date';
+    const dateText = document.createElement('span');
+    dateText.textContent = formatDate(dateKey);
+    const totalText = document.createElement('span');
+    totalText.textContent = `支${formatMoney(dayExpense)} 收${formatMoney(dayIncome)}`;
+    header.append(dateText, totalText);
+    group.appendChild(header);
+
     dayTxns.forEach(t => {
       const cat = getCategoryInfo(t.category, t.type);
-      html += `
-        <div class="txn-item">
-          <div class="txn-icon">${cat.icon}</div>
-          <div class="txn-info">
-            <div class="txn-cat">${cat.name}</div>
-            <div class="txn-note">${t.note || ''}</div>
-          </div>
-          <div class="txn-amount ${t.type}">${t.type === 'income' ? '+' : '-'}${formatMoney(t.amount)}</div>
-        </div>`;
+
+      const item = document.createElement('div');
+      item.className = 'txn-item';
+
+      const icon = document.createElement('div');
+      icon.className = 'txn-icon';
+      icon.textContent = cat.icon;
+
+      const info = document.createElement('div');
+      info.className = 'txn-info';
+      const catName = document.createElement('div');
+      catName.className = 'txn-cat';
+      catName.textContent = cat.name;
+      const note = document.createElement('div');
+      note.className = 'txn-note';
+      note.textContent = t.note || '';
+      info.append(catName, note);
+
+      const amount = document.createElement('div');
+      amount.className = 'txn-amount ' + t.type;
+      amount.textContent = `${t.type === 'income' ? '+' : '-'}${formatMoney(t.amount)}`;
+
+      const actions = document.createElement('div');
+      actions.className = 'txn-actions';
+      actions.append(
+        makeTxnAction('编辑', '', () => editTransaction(t.id)),
+        makeTxnAction('删除', 'delete', () => deleteTransaction(t.id))
+      );
+
+      item.append(icon, info, amount, actions);
+      group.appendChild(item);
     });
-    html += '</div>';
+
+    list.appendChild(group);
   });
-  
-  list.innerHTML = html;
 }
 
-function showAddModal() {
+function resetTransactionForm() {
   currentType = 'expense';
   selectedCategory = null;
+  editingId = null;
+  document.getElementById('addModalTitle').textContent = '💰 记一笔账';
   document.getElementById('amountInput').value = '';
   document.getElementById('noteInput').value = '';
   document.getElementById('typeExpense').classList.add('active');
   document.getElementById('typeIncome').classList.remove('active');
+  renderCategories();
+}
+
+function showAddModal() {
+  resetTransactionForm();
+  document.getElementById('addModal').classList.remove('hidden');
+}
+
+function editTransaction(id) {
+  const txn = data.transactions.find(t => t.id === id);
+  if (!txn) return;
+
+  currentType = txn.type;
+  selectedCategory = txn.category;
+  editingId = txn.id;
+  document.getElementById('addModalTitle').textContent = '✏️ 编辑记录';
+  document.getElementById('amountInput').value = txn.amount;
+  document.getElementById('noteInput').value = txn.note || '';
+  document.getElementById('typeExpense').classList.toggle('active', txn.type === 'expense');
+  document.getElementById('typeIncome').classList.toggle('active', txn.type === 'income');
   renderCategories();
   document.getElementById('addModal').classList.remove('hidden');
 }
@@ -380,25 +462,51 @@ function selectCategory(catId) {
   renderCategories();
 }
 
+function refreshDataViews() {
+  renderTransactions();
+  updateBalance();
+  if (!document.getElementById('tab-stats').classList.contains('hidden')) renderStats();
+  if (!document.getElementById('tab-budget').classList.contains('hidden')) renderBudget();
+}
+
 function saveTransaction() {
-  const amount = parseFloat(document.getElementById('amountInput').value);
-  if (!amount || amount <= 0) return alert('请输入有效金额');
+  const rawAmount = document.getElementById('amountInput').value;
+  if (!isValidAmount(rawAmount)) return alert('请输入有效金额');
   if (!selectedCategory) return alert('请选择分类');
-  
+
+  const amount = normalizeAmount(rawAmount);
+  const note = document.getElementById('noteInput').value.trim();
+
+  if (editingId) {
+    const txn = data.transactions.find(t => t.id === editingId);
+    if (!txn) {
+      editingId = null;
+      return;
+    }
+    txn.type = currentType;
+    txn.amount = amount;
+    txn.category = selectedCategory;
+    txn.note = note;
+    saveData();
+    closeModal('addModal');
+    refreshDataViews();
+    showToast('记录已更新！');
+    return;
+  }
+
   const txn = {
     id: generateId(),
     type: currentType,
     amount,
     category: selectedCategory,
-    note: document.getElementById('noteInput').value.trim(),
+    note,
     date: new Date().toISOString()
   };
-  
+
   data.transactions.unshift(txn);
   saveData();
   closeModal('addModal');
-  renderTransactions();
-  updateBalance();
+  refreshDataViews();
   showToast('记账成功！');
 }
 
@@ -406,17 +514,14 @@ function deleteTransaction(id) {
   if (!confirm('确定删除这条记录？')) return;
   data.transactions = data.transactions.filter(t => t.id !== id);
   saveData();
-  renderTransactions();
-  updateBalance();
+  refreshDataViews();
   showToast('已删除');
 }
 
 function renderStats() {
   const now = new Date();
-  const monthTxns = data.transactions.filter(t => {
-    const d = new Date(t.date);
-    return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
-  });
+  const currentMonth = monthKey(now);
+  const monthTxns = data.transactions.filter(t => monthKey(t.date) === currentMonth);
   
   // Expense by category
   const expChart = document.getElementById('expenseChart');
@@ -478,10 +583,9 @@ function renderStats() {
       }).join('')}
     </div>`;
   
-  // Summary
   const totalInc = data.transactions.filter(t => t.type === 'income').reduce((s,t) => s + t.amount, 0);
   const totalExpAll = data.transactions.filter(t => t.type === 'expense').reduce((s,t) => s + t.amount, 0);
-  const avgDaily = data.transactions.length > 0 ? totalExpAll / 30 : 0;
+  const avgDaily = averageDailyExpense(data.transactions, now);
   
   document.getElementById('summaryStats').innerHTML = `
     <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px">
@@ -499,33 +603,32 @@ function renderStats() {
       </div>
       <div style="text-align:center;padding:12px;background:var(--surface2);border-radius:10px">
         <div style="font-size:18px;font-weight:700;color:var(--warning)">${formatMoney(avgDaily)}</div>
-        <div style="font-size:11px;color:var(--text2)">日均支出</div>
+        <div style="font-size:11px;color:var(--text2)">本月日均支出</div>
       </div>
     </div>`;
 }
 
 function renderBudget() {
-  document.getElementById('budgetInput').value = data.budget || '';
+  const monthInput = document.getElementById('budgetMonth');
+  monthInput.value = budgetMonthKey;
+
+  const budget = getBudget(data.budgets, budgetMonthKey);
+  document.getElementById('budgetInput').value = budget || '';
   const status = document.getElementById('budgetStatus');
-  
-  if (!data.budget) {
-    status.innerHTML = '<div class="empty-state"><p>设置预算来跟踪你的支出</p></div>';
+
+  if (!budget) {
+    status.innerHTML = `<div class="empty-state"><p>${monthLabel(budgetMonthKey)}尚未设置预算</p></div>`;
     return;
   }
-  
-  const now = new Date();
-  const monthExp = data.transactions.filter(t => {
-    const d = new Date(t.date);
-    return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear() && t.type === 'expense';
-  }).reduce((s,t) => s + t.amount, 0);
-  
-  const pct = Math.min(100, (monthExp / data.budget) * 100);
-  const remaining = data.budget - monthExp;
+
+  const monthExp = sumByType(data.transactions, 'expense', budgetMonthKey);
+  const pct = Math.min(100, (monthExp / budget) * 100);
+  const remaining = budget - monthExp;
   const color = pct >= 100 ? 'var(--expense)' : pct >= 80 ? 'var(--warning)' : 'var(--income)';
-  
+
   status.innerHTML = `
     <div style="text-align:center;margin-bottom:12px">
-      <div style="font-size:12px;color:var(--text2)">已用 ${pct.toFixed(0)}%</div>
+      <div style="font-size:12px;color:var(--text2)">${monthLabel(budgetMonthKey)} · 已用 ${pct.toFixed(0)}%</div>
       <div style="font-size:24px;font-weight:700;color:${color}">${formatMoney(remaining)}</div>
       <div style="font-size:12px;color:var(--text2)">${remaining >= 0 ? '剩余预算' : '超支'}</div>
     </div>
@@ -534,18 +637,77 @@ function renderBudget() {
     </div>
     <div style="display:flex;justify-content:space-between;margin-top:8px;font-size:12px;color:var(--text2)">
       <span>已花 ${formatMoney(monthExp)}</span>
-      <span>预算 ${formatMoney(data.budget)}</span>
+      <span>预算 ${formatMoney(budget)}</span>
     </div>
-    ${pct >= 100 ? '<div style="margin-top:12px;padding:10px;background:rgba(248,81,73,0.1);border:1px solid var(--expense);border-radius:10px;text-align:center;color:var(--expense);font-size:13px">⚠️ 本月支出已超出预算！</div>' : ''}
+    ${pct >= 100 ? '<div style="margin-top:12px;padding:10px;background:rgba(248,81,73,0.1);border:1px solid var(--expense);border-radius:10px;text-align:center;color:var(--expense);font-size:13px">⚠️ 该月支出已超出预算！</div>' : ''}
   `;
 }
 
+function changeBudgetMonth() {
+  const value = document.getElementById('budgetMonth').value;
+  if (/^\d{4}-\d{2}$/.test(value)) {
+    budgetMonthKey = value;
+  }
+  renderBudget();
+}
+
 function saveBudget() {
-  const val = parseFloat(document.getElementById('budgetInput').value);
-  data.budget = val || 0;
+  const raw = document.getElementById('budgetInput').value.trim();
+  if (raw === '') {
+    data.budgets = setBudget(data.budgets, budgetMonthKey, 0);
+    saveData();
+    renderBudget();
+    showToast('预算已清除');
+    return;
+  }
+
+  const val = Number(raw);
+  if (!Number.isFinite(val) || val < 0) return alert('请输入有效的预算金额');
+
+  data.budgets = setBudget(data.budgets, budgetMonthKey, val);
   saveData();
   renderBudget();
-  showToast('预算已保存！');
+  showToast(val > 0 ? '预算已保存！' : '预算已清除');
+}
+
+function exportData() {
+  const payload = exportPayload(data);
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `easy-ledger-${new Date().toISOString().slice(0, 10)}.json`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  showToast('已导出 JSON');
+}
+
+function triggerImport() {
+  document.getElementById('importFile').click();
+}
+
+async function importData(event) {
+  const input = event.target;
+  const file = input.files && input.files[0];
+  if (!file) return;
+
+  try {
+    const imported = parseImport(await file.text());
+    const monthCount = Object.keys(imported.budgets).length;
+    if (!confirm(`导入将覆盖当前数据：${imported.transactions.length} 条记录、${monthCount} 个月预算。继续？`)) return;
+
+    data = imported;
+    saveData();
+    budgetMonthKey = monthKey(new Date());
+    refreshDataViews();
+    showToast('数据导入成功');
+  } catch (error) {
+    alert('导入失败：' + error.message);
+  } finally {
+    input.value = '';
+  }
 }
 
 function closeModal(id) {
@@ -560,7 +722,23 @@ function showToast(msg) {
   setTimeout(() => toast.remove(), 2000);
 }
 
-// Init
+Object.assign(window, {
+  switchTab,
+  renderTransactions,
+  showAddModal,
+  editTransaction,
+  deleteTransaction,
+  saveTransaction,
+  selectType,
+  selectCategory,
+  closeModal,
+  changeBudgetMonth,
+  saveBudget,
+  exportData,
+  triggerImport,
+  importData
+});
+
 loadData();
 updateBalance();
 renderTransactions();
